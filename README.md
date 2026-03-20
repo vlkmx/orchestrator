@@ -33,6 +33,10 @@ src/
     shell-tools.ts
   validator/
     validator.ts
+  server/
+    server.ts
+  runtime/
+    events.ts
   config.ts
   logger.ts
 
@@ -53,6 +57,15 @@ examples/
   project-b/
     package.json
     src/components/README.md
+
+web/
+  src/
+    App.tsx
+    main.tsx
+    components/ui/*
+    lib/utils.ts
+  package.json
+  vite.config.ts
 ```
 
 ## Install
@@ -109,6 +122,32 @@ Verbose:
 ```bash
 node dist/index.js --goal "..." --verbose
 ```
+
+## Web GUI (Vite + React)
+
+API server:
+
+```bash
+npm run dev:api
+```
+
+Web UI (second terminal):
+
+```bash
+npm run dev:web
+```
+
+Open `http://localhost:5173`.
+
+What GUI supports:
+
+- start global task from form
+- pass source/target directories
+- configure goal + build/lint/test commands
+- toggle `dry-run`, `verbose`, `demo-mode`
+- live event stream via SSE
+- command timeline (start/output/finish)
+- iteration log viewer and run artifacts
 
 ## CLI flags
 

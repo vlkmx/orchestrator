@@ -2,6 +2,7 @@ import "dotenv/config";
 
 import path from "node:path";
 import { z } from "zod";
+import { EventSink } from "./runtime/events.js";
 
 const envSchema = z.object({
   OPENAI_API_KEY: z.string().optional(),
@@ -42,6 +43,8 @@ export interface AppConfig {
   supervisorMaxJsonRetries: number;
   workerMaxJsonRetries: number;
   validatorTimeoutMs: number;
+  runId: string;
+  eventSink: EventSink | null;
 }
 
 let cachedConfig: AppConfig | null = null;
@@ -53,6 +56,7 @@ export function getConfig(): AppConfig {
 
   const parsed = envSchema.parse(process.env);
   const cwd = process.cwd();
+  const runId = "default-run";
 
   const config: AppConfig = {
     openAIApiKey: parsed.OPENAI_API_KEY,
@@ -70,7 +74,9 @@ export function getConfig(): AppConfig {
     demoMode: parsed.DEMO_MODE ?? false,
     supervisorMaxJsonRetries: parsed.SUPERVISOR_MAX_JSON_RETRIES,
     workerMaxJsonRetries: parsed.WORKER_MAX_JSON_RETRIES,
-    validatorTimeoutMs: parsed.VALIDATOR_TIMEOUT_MS
+    validatorTimeoutMs: parsed.VALIDATOR_TIMEOUT_MS,
+    runId,
+    eventSink: null
   };
 
   cachedConfig = config;

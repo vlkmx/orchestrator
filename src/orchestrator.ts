@@ -32,6 +32,14 @@ export class Orchestrator {
 
     let state = await this.bootstrapState(options);
     this.logger.info(`Orchestrator started. goal="${state.globalGoal}"`);
+    this.config.eventSink?.emitEvent({
+      runId: this.config.runId,
+      type: "run_started",
+      message: `Run started: ${state.globalGoal}`,
+      data: {
+        goal: state.globalGoal
+      }
+    });
 
     while (state.status === "running") {
       if (state.iteration >= this.config.maxIterations) {
@@ -43,6 +51,12 @@ export class Orchestrator {
 
       const iteration = state.iteration + 1;
       this.logger.info(`Iteration ${iteration} started`);
+      this.config.eventSink?.emitEvent({
+        runId: this.config.runId,
+        type: "iteration_started",
+        message: `Iteration ${iteration} started`,
+        data: { iteration }
+      });
 
       const supervisorContext = await buildSupervisorContext(
         state,
@@ -51,6 +65,15 @@ export class Orchestrator {
 
       const supervisorRun = await this.supervisor.decide(state, supervisorContext);
       const decision = supervisorRun.decision;
+      this.config.eventSink?.emitEvent({
+        runId: this.config.runId,
+        type: "supervisor_decision",
+        message: `Supervisor decision: ${decision.decision}`,
+        data: {
+          iteration,
+          decision
+        }
+      });
 
       let workerResult: WorkerResult | null = null;
       let workerRawResponse = "";
@@ -150,19 +173,46 @@ export class Orchestrator {
       };
 
       await this.stateManager.saveState(state);
+      this.config.eventSink?.emitEvent({
+        runId: this.config.runId,
+        type: "state_saved",
+        message: "State saved",
+        data: {
+          iteration,
+          statePath: this.stateManager.paths.stateFilePath
+        }
+      });
       await this.stateManager.saveIterationLog(logEntry);
       await this.stateManager.writeSummary(state, decision.reason, workerResult, validationResult);
       await this.stateManager.writeLatestStatus(state, notes.join(" | ") || decision.reason);
 
       this.logger.info(`Iteration ${iteration} finished with state=${state.status}`);
+      this.config.eventSink?.emitEvent({
+        runId: this.config.runId,
+        type: "iteration_finished",
+        message: `Iteration ${iteration} finished with ${state.status}`,
+        data: { iteration, status: state.status }
+      });
 
       if (state.status === "done") {
         this.logger.info("Orchestration completed successfully.");
+        this.config.eventSink?.emitEvent({
+          runId: this.config.runId,
+          type: "run_finished",
+          message: "Run finished successfully",
+          data: { iteration }
+        });
         return;
       }
 
       if (state.status === "failed") {
         this.logger.error("Orchestration failed. Check logs/latest.md and iteration logs.");
+        this.config.eventSink?.emitEvent({
+          runId: this.config.runId,
+          type: "run_failed",
+          message: "Run failed",
+          data: { iteration, blockers: state.blockers }
+        });
         throw new Error("Orchestration failed");
       }
     }
@@ -204,8 +254,27 @@ export class Orchestrator {
     );
 
     const workerRun = await this.worker.runOneTask(state, task, workerContext, iteration, options.dryRun);
+    this.config.eventSink?.emitEvent({
+      runId: this.config.runId,
+      type: "worker_result",
+      message: `Worker finished task ${task.id} with ${workerRun.result.taskStatus}`,
+      data: {
+        iteration,
+        taskId: task.id,
+        workerResult: workerRun.result
+      }
+    });
     const validationResult = await runValidator(this.config);
     state.lastValidation = validationResult;
+    this.config.eventSink?.emitEvent({
+      runId: this.config.runId,
+      type: "validation_result",
+      message: `Validator overall: ${validationResult.overall}`,
+      data: {
+        iteration,
+        validationResult
+      }
+    });
 
     this.applyWorkerAndValidationOutcome(state, task, workerRun.result, validationResult, notes);
 
