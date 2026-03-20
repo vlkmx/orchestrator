@@ -1,0 +1,15 @@
+{
+  "globalGoal": "Постепенно перенести проект A в проект B по компонентам",
+  "status": "running",
+  "iteration": 0,
+  "plan": [],
+  "currentTask": null,
+  "completedTasks": [],
+  "failedTasks": [],
+  "retryCounters": {},
+  "lastValidation": null,
+  "blockers": [],
+  "history": [],
+  "createdAt": "2026-03-20T00:00:00.000Z",
+  "updatedAt": "2026-03-20T00:00:00.000Z"
+}

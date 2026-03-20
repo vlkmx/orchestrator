@@ -1,0 +1,363 @@
+import { AppConfig } from "./config.js";
+import { Logger } from "./logger.js";
+import { SupervisorAgent } from "./agents/supervisor.js";
+import { WorkerAgent } from "./agents/worker.js";
+import { StateManager } from "./state/state-manager.js";
+import {
+  CliOptions,
+  HistoryEntry,
+  IterationLog,
+  OrchestratorState,
+  SupervisorDecision,
+  Task,
+  ValidatorResult,
+  WorkerResult
+} from "./state/types.js";
+import { buildSupervisorContext, buildWorkerContext } from "./tools/context-builder.js";
+import { runValidator } from "./validator/validator.js";
+
+export class Orchestrator {
+  private readonly stateManager: StateManager;
+  private readonly supervisor: SupervisorAgent;
+  private readonly worker: WorkerAgent;
+
+  constructor(private readonly config: AppConfig, private readonly logger: Logger) {
+    this.stateManager = new StateManager(config, logger);
+    this.supervisor = new SupervisorAgent(config, logger);
+    this.worker = new WorkerAgent(config, logger);
+  }
+
+  async run(options: CliOptions): Promise<void> {
+    await this.stateManager.ensureStorage();
+
+    let state = await this.bootstrapState(options);
+    this.logger.info(`Orchestrator started. goal="${state.globalGoal}"`);
+
+    while (state.status === "running") {
+      if (state.iteration >= this.config.maxIterations) {
+        state.status = "failed";
+        state.blockers.push(`Reached MAX_ITERATIONS=${this.config.maxIterations}`);
+        await this.persistTerminalState(state, "Reached max iterations limit.");
+        throw new Error(`Reached MAX_ITERATIONS=${this.config.maxIterations}`);
+      }
+
+      const iteration = state.iteration + 1;
+      this.logger.info(`Iteration ${iteration} started`);
+
+      const supervisorContext = await buildSupervisorContext(
+        state,
+        this.stateManager.paths.summaryFilePath
+      );
+
+      const supervisorRun = await this.supervisor.decide(state, supervisorContext);
+      const decision = supervisorRun.decision;
+
+      let workerResult: WorkerResult | null = null;
+      let workerRawResponse = "";
+      let validationResult: ValidatorResult | null = null;
+      const notes: string[] = [];
+
+      if (decision.decision === "failed") {
+        state.status = "failed";
+        state.blockers.push(`Supervisor failed: ${decision.reason}`);
+        notes.push("Supervisor requested fatal stop.");
+      } else if (decision.decision === "done") {
+        if (this.canFinish(state, state.lastValidation)) {
+          state.status = "done";
+          state.currentTask = null;
+          notes.push("Supervisor marked objective done and stop conditions are satisfied.");
+        } else {
+          notes.push("Supervisor returned done but stop conditions were not satisfied. Falling back.");
+          const fallbackTask = this.pickFallbackTask(state);
+          if (!fallbackTask) {
+            state.status = "failed";
+            state.blockers.push("No fallback task available after premature done decision.");
+          } else {
+            const fallbackDecision: SupervisorDecision = {
+              decision: "continue",
+              reason: "Fallback from premature done.",
+              nextTask: {
+                id: fallbackTask.id,
+                type: fallbackTask.type,
+                title: fallbackTask.title,
+                component: fallbackTask.component,
+                sourcePaths: fallbackTask.sourcePaths,
+                targetPaths: fallbackTask.targetPaths,
+                instructions: fallbackTask.instructions,
+                acceptanceCriteria: fallbackTask.acceptanceCriteria
+              },
+              statePatch: {
+                markDone: [],
+                markInProgress: [fallbackTask.id],
+                markBlocked: []
+              }
+            };
+
+            const runOutcome = await this.runTaskIteration(
+              state,
+              fallbackDecision,
+              iteration,
+              options,
+              notes
+            );
+            state = runOutcome.state;
+            workerResult = runOutcome.workerResult;
+            workerRawResponse = runOutcome.workerRawResponse;
+            validationResult = runOutcome.validationResult;
+          }
+        }
+      } else {
+        const runOutcome = await this.runTaskIteration(state, decision, iteration, options, notes);
+        state = runOutcome.state;
+        workerResult = runOutcome.workerResult;
+        workerRawResponse = runOutcome.workerRawResponse;
+        validationResult = runOutcome.validationResult;
+      }
+
+      if (state.status === "running" && this.canFinish(state, validationResult ?? state.lastValidation)) {
+        state.status = "done";
+        state.currentTask = null;
+        notes.push("Automatic completion conditions satisfied.");
+      }
+
+      if (state.status === "running" && this.detectStagnation(state)) {
+        state.status = "failed";
+        state.blockers.push("Detected stagnation: no successful progress across recent iterations.");
+        notes.push("Loop protection triggered due to stagnation.");
+      }
+
+      state.iteration = iteration;
+      state.updatedAt = new Date().toISOString();
+
+      const logEntry: IterationLog = {
+        iteration,
+        timestamp: new Date().toISOString(),
+        decision,
+        supervisorRawResponse: supervisorRun.rawResponse,
+        workerResult,
+        workerRawResponse,
+        validationResult,
+        stateSnapshot: {
+          status: state.status,
+          iteration: state.iteration,
+          currentTask: state.currentTask,
+          completedTasks: state.completedTasks,
+          failedTasks: state.failedTasks,
+          retryCounters: state.retryCounters,
+          blockers: state.blockers
+        },
+        notes
+      };
+
+      await this.stateManager.saveState(state);
+      await this.stateManager.saveIterationLog(logEntry);
+      await this.stateManager.writeSummary(state, decision.reason, workerResult, validationResult);
+      await this.stateManager.writeLatestStatus(state, notes.join(" | ") || decision.reason);
+
+      this.logger.info(`Iteration ${iteration} finished with state=${state.status}`);
+
+      if (state.status === "done") {
+        this.logger.info("Orchestration completed successfully.");
+        return;
+      }
+
+      if (state.status === "failed") {
+        this.logger.error("Orchestration failed. Check logs/latest.md and iteration logs.");
+        throw new Error("Orchestration failed");
+      }
+    }
+  }
+
+  private async runTaskIteration(
+    state: OrchestratorState,
+    decision: SupervisorDecision,
+    iteration: number,
+    options: CliOptions,
+    notes: string[]
+  ): Promise<{
+    state: OrchestratorState;
+    workerResult: WorkerResult;
+    workerRawResponse: string;
+    validationResult: ValidatorResult;
+  }> {
+    if (!decision.nextTask) {
+      throw new Error(`Decision ${decision.decision} requires nextTask.`);
+    }
+
+    state.plan = this.applyStatePatch(state.plan, decision.statePatch);
+
+    const task: Task = {
+      ...decision.nextTask,
+      status: "in_progress"
+    };
+
+    state.plan = this.stateManager.upsertTask(state.plan, task);
+    state.plan = this.stateManager.setTaskStatus(state.plan, task.id, "in_progress");
+    state.currentTask = task;
+
+    const workerContext = await buildWorkerContext(
+      state,
+      task,
+      this.stateManager.paths.summaryFilePath,
+      this.config.projectSourcePath,
+      this.config.projectTargetPath
+    );
+
+    const workerRun = await this.worker.runOneTask(state, task, workerContext, iteration, options.dryRun);
+    const validationResult = await runValidator(this.config);
+    state.lastValidation = validationResult;
+
+    this.applyWorkerAndValidationOutcome(state, task, workerRun.result, validationResult, notes);
+
+    const historyEntry: HistoryEntry = {
+      iteration,
+      timestamp: new Date().toISOString(),
+      taskId: task.id,
+      decision: decision.decision,
+      decisionReason: decision.reason,
+      workerSummary: workerRun.result.summary,
+      workerStatus: workerRun.result.taskStatus,
+      validationOverall: validationResult.overall
+    };
+
+    state.history.push(historyEntry);
+
+    return {
+      state,
+      workerResult: workerRun.result,
+      workerRawResponse: workerRun.rawResponse,
+      validationResult
+    };
+  }
+
+  private applyWorkerAndValidationOutcome(
+    state: OrchestratorState,
+    task: Task,
+    workerResult: WorkerResult,
+    validation: ValidatorResult,
+    notes: string[]
+  ): void {
+    const isValidationFailed = validation.overall === "failed";
+    const taskRetries = state.retryCounters[task.id] ?? 0;
+
+    if (workerResult.taskStatus === "completed" && !isValidationFailed) {
+      state.plan = this.stateManager.setTaskStatus(state.plan, task.id, "completed");
+      if (!state.completedTasks.includes(task.id)) {
+        state.completedTasks.push(task.id);
+      }
+      state.blockers = state.blockers.filter((item) => !item.includes(task.id));
+      notes.push(`Task ${task.id} marked completed.`);
+      return;
+    }
+
+    const nextRetryCount = taskRetries + 1;
+    state.retryCounters[task.id] = nextRetryCount;
+
+    if (workerResult.taskStatus === "failed") {
+      state.plan = this.stateManager.setTaskStatus(state.plan, task.id, "failed");
+      if (!state.failedTasks.includes(task.id)) {
+        state.failedTasks.push(task.id);
+      }
+      state.blockers.push(`Task ${task.id} failed at worker stage.`);
+      notes.push(`Worker failed task ${task.id}. retry=${nextRetryCount}`);
+    } else if (isValidationFailed) {
+      state.plan = this.stateManager.setTaskStatus(state.plan, task.id, "blocked");
+      state.blockers.push(`Task ${task.id} blocked by validator failure.`);
+      notes.push(`Validator failed for task ${task.id}. retry=${nextRetryCount}`);
+    } else {
+      state.plan = this.stateManager.setTaskStatus(state.plan, task.id, "in_progress");
+      notes.push(`Task ${task.id} partial completion. retry=${nextRetryCount}`);
+    }
+
+    if (nextRetryCount > this.config.maxRetriesPerTask) {
+      state.status = "failed";
+      state.blockers.push(
+        `Task ${task.id} exceeded MAX_RETRIES_PER_TASK=${this.config.maxRetriesPerTask}`
+      );
+      notes.push(`Fatal: retry limit exceeded for task ${task.id}.`);
+    }
+  }
+
+  private applyStatePatch(plan: Task[], patch: SupervisorDecision["statePatch"]): Task[] {
+    const markDone = new Set(patch.markDone);
+    const markInProgress = new Set(patch.markInProgress);
+    const markBlocked = new Set(patch.markBlocked);
+
+    return plan.map((task) => {
+      if (markDone.has(task.id)) {
+        return { ...task, status: "completed" };
+      }
+      if (markBlocked.has(task.id)) {
+        return { ...task, status: "blocked" };
+      }
+      if (markInProgress.has(task.id)) {
+        return { ...task, status: "in_progress" };
+      }
+      return task;
+    });
+  }
+
+  private canFinish(state: OrchestratorState, validation: ValidatorResult | null): boolean {
+    const hasPlan = state.plan.length > 0;
+    const allTasksDone = hasPlan && state.plan.every((task) => task.status === "completed");
+    const noBlockingValidation = !validation || validation.overall !== "failed";
+    const noBlockers = state.blockers.length === 0;
+
+    return allTasksDone && noBlockingValidation && noBlockers;
+  }
+
+  private pickFallbackTask(state: OrchestratorState): Task | null {
+    const current = state.plan.find((task) => task.status === "in_progress");
+    if (current) {
+      return current;
+    }
+
+    const pending = state.plan.find((task) => task.status === "pending");
+    if (pending) {
+      return pending;
+    }
+
+    return null;
+  }
+
+  private detectStagnation(state: OrchestratorState): boolean {
+    if (state.history.length < 5) {
+      return false;
+    }
+
+    const recent = state.history.slice(-5);
+    return recent.every((item) => item.workerStatus !== "completed");
+  }
+
+  private async bootstrapState(options: CliOptions): Promise<OrchestratorState> {
+    const existing = await this.stateManager.loadState();
+
+    if (options.resume) {
+      if (!existing) {
+        throw new Error("--resume requested but state/state.json does not exist.");
+      }
+      existing.status = existing.status === "done" ? "done" : "running";
+      this.stateManager.logLoadedState(existing);
+      return existing;
+    }
+
+    if (!options.goal) {
+      throw new Error("--goal is required when starting without --resume.");
+    }
+
+    const fresh = this.stateManager.createInitialState(options.goal);
+    fresh.status = "running";
+    await this.stateManager.saveState(fresh);
+    await this.stateManager.writeSummary(fresh, "Initialized new orchestrator run.", null, null);
+    await this.stateManager.writeLatestStatus(fresh, "Initialized new orchestrator run.");
+
+    return fresh;
+  }
+
+  private async persistTerminalState(state: OrchestratorState, note: string): Promise<void> {
+    state.updatedAt = new Date().toISOString();
+    await this.stateManager.saveState(state);
+    await this.stateManager.writeSummary(state, note, null, state.lastValidation);
+    await this.stateManager.writeLatestStatus(state, note);
+  }
+}
