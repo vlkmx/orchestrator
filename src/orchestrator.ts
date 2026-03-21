@@ -85,10 +85,29 @@ export class Orchestrator {
         state.blockers.push(`Supervisor failed: ${decision.reason}`);
         notes.push("Supervisor requested fatal stop.");
       } else if (decision.decision === "done") {
-        if (this.canFinish(state, state.lastValidation)) {
+        if (this.canFinalizeNow(state, state.lastValidation)) {
+          const finalValidation = await runValidator(this.config);
+          state.lastValidation = finalValidation;
+          validationResult = finalValidation;
+          this.config.eventSink?.emitEvent({
+            runId: this.config.runId,
+            type: "validation_result",
+            message: `Final validator overall: ${finalValidation.overall}`,
+            data: {
+              iteration,
+              validationResult: finalValidation,
+              final: true
+            }
+          });
+          if (finalValidation.overall === "failed") {
+            state.status = "failed";
+            state.blockers.push("Final validation failed before completion.");
+            notes.push("Final validation failed.");
+          } else {
           state.status = "done";
           state.currentTask = null;
           notes.push("Supervisor marked objective done and stop conditions are satisfied.");
+          }
         } else {
           notes.push("Supervisor returned done but stop conditions were not satisfied. Falling back.");
           const fallbackTask = this.pickFallbackTask(state);
@@ -135,12 +154,6 @@ export class Orchestrator {
         workerResult = runOutcome.workerResult;
         workerRawResponse = runOutcome.workerRawResponse;
         validationResult = runOutcome.validationResult;
-      }
-
-      if (state.status === "running" && this.canFinish(state, validationResult ?? state.lastValidation)) {
-        state.status = "done";
-        state.currentTask = null;
-        notes.push("Automatic completion conditions satisfied.");
       }
 
       if (state.status === "running" && this.detectStagnation(state)) {
@@ -264,7 +277,9 @@ export class Orchestrator {
         workerResult: workerRun.result
       }
     });
-    const validationResult = await runValidator(this.config);
+    const validationResult = this.shouldRunValidation(state, task, workerRun.result)
+      ? await runValidator(this.config)
+      : this.createSkippedValidation();
     state.lastValidation = validationResult;
     this.config.eventSink?.emitEvent({
       runId: this.config.runId,
@@ -366,13 +381,11 @@ export class Orchestrator {
     });
   }
 
-  private canFinish(state: OrchestratorState, validation: ValidatorResult | null): boolean {
-    const hasPlan = state.plan.length > 0;
-    const allTasksDone = hasPlan && state.plan.every((task) => task.status === "completed");
+  private canFinalizeNow(state: OrchestratorState, validation: ValidatorResult | null): boolean {
     const noBlockingValidation = !validation || validation.overall !== "failed";
     const noBlockers = state.blockers.length === 0;
 
-    return allTasksDone && noBlockingValidation && noBlockers;
+    return noBlockingValidation && noBlockers;
   }
 
   private pickFallbackTask(state: OrchestratorState): Task | null {
@@ -391,11 +404,21 @@ export class Orchestrator {
 
   private detectStagnation(state: OrchestratorState): boolean {
     if (state.history.length < 5) {
-      return false;
+      if (state.history.length < 3) {
+        return false;
+      }
     }
 
-    const recent = state.history.slice(-5);
-    return recent.every((item) => item.workerStatus !== "completed");
+    const recentFive = state.history.slice(-5);
+    const noCompletedInFive = recentFive.length === 5 && recentFive.every((item) => item.workerStatus !== "completed");
+
+    const recentThree = state.history.slice(-3);
+    const repeatedSameTaskNoProgress =
+      recentThree.length === 3 &&
+      recentThree.every((item) => item.taskId === recentThree[0]?.taskId) &&
+      recentThree.every((item) => item.workerStatus === "partial");
+
+    return noCompletedInFive || repeatedSameTaskNoProgress;
   }
 
   private async bootstrapState(options: CliOptions): Promise<OrchestratorState> {
@@ -428,5 +451,37 @@ export class Orchestrator {
     await this.stateManager.saveState(state);
     await this.stateManager.writeSummary(state, note, null, state.lastValidation);
     await this.stateManager.writeLatestStatus(state, note);
+  }
+
+  private shouldRunValidation(
+    state: OrchestratorState,
+    task: Task,
+    workerResult: WorkerResult
+  ): boolean {
+    if (task.type === "analyze") {
+      return false;
+    }
+
+    const hasFileChanges =
+      workerResult.changedFiles.length > 0 ||
+      workerResult.createdFiles.length > 0 ||
+      workerResult.deletedFiles.length > 0;
+
+    if (!hasFileChanges) {
+      return false;
+    }
+
+    const migratedCount = state.completedTasks.filter((taskId) => taskId.startsWith("migrate::")).length;
+    const nextCount = migratedCount + 1;
+    return nextCount % this.config.validateEveryNTasks === 0;
+  }
+
+  private createSkippedValidation(): ValidatorResult {
+    return {
+      build: { status: "skipped", exitCode: 0, stdout: "", stderr: "" },
+      lint: { status: "skipped", exitCode: 0, stdout: "", stderr: "" },
+      tests: { status: "skipped", exitCode: 0, stdout: "", stderr: "" },
+      overall: "passed"
+    };
   }
 }

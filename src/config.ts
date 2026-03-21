@@ -23,7 +23,20 @@ const envSchema = z.object({
     .transform((value) => value === "true" || value === "1"),
   SUPERVISOR_MAX_JSON_RETRIES: z.coerce.number().int().positive().default(3),
   WORKER_MAX_JSON_RETRIES: z.coerce.number().int().positive().default(3),
-  VALIDATOR_TIMEOUT_MS: z.coerce.number().int().positive().default(120000)
+  VALIDATOR_TIMEOUT_MS: z.coerce.number().int().positive().default(120000),
+  DETERMINISTIC_SUPERVISOR: z
+    .string()
+    .optional()
+    .transform((value) => value !== "false"),
+  DETERMINISTIC_WORKER: z
+    .string()
+    .optional()
+    .transform((value) => value === "true"),
+  VALIDATE_EVERY_N_TASKS: z.coerce.number().int().positive().default(3),
+  WORKER_WRITE_REPORTS: z
+    .string()
+    .optional()
+    .transform((value) => value === "true")
 });
 
 export interface AppConfig {
@@ -45,6 +58,10 @@ export interface AppConfig {
   validatorTimeoutMs: number;
   runId: string;
   eventSink: EventSink | null;
+  deterministicSupervisor: boolean;
+  deterministicWorker: boolean;
+  validateEveryNTasks: number;
+  workerWriteReports: boolean;
 }
 
 let cachedConfig: AppConfig | null = null;
@@ -76,9 +93,27 @@ export function getConfig(): AppConfig {
     workerMaxJsonRetries: parsed.WORKER_MAX_JSON_RETRIES,
     validatorTimeoutMs: parsed.VALIDATOR_TIMEOUT_MS,
     runId,
-    eventSink: null
+    eventSink: null,
+    deterministicSupervisor: parsed.DETERMINISTIC_SUPERVISOR ?? true,
+    deterministicWorker: parsed.DETERMINISTIC_WORKER ?? false,
+    validateEveryNTasks: parsed.VALIDATE_EVERY_N_TASKS,
+    workerWriteReports: parsed.WORKER_WRITE_REPORTS ?? false
   };
+
+  assertWithinProject(config.projectSourcePath, "PROJECT_SOURCE_PATH");
+  assertWithinProject(config.projectTargetPath, "PROJECT_TARGET_PATH");
+  assertWithinProject(config.stateDir, "STATE_DIR");
+  assertWithinProject(config.logsDir, "LOGS_DIR");
 
   cachedConfig = config;
   return config;
+}
+
+function assertWithinProject(absolutePath: string, label: string): void {
+  const projectRoot = path.resolve(process.cwd());
+  const normalized = path.resolve(absolutePath);
+  const rootPrefix = projectRoot.endsWith(path.sep) ? projectRoot : `${projectRoot}${path.sep}`;
+  if (!(normalized === projectRoot || normalized.startsWith(rootPrefix))) {
+    throw new Error(`${label} must be inside project root: ${projectRoot}`);
+  }
 }

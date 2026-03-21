@@ -38,6 +38,17 @@ export interface SupervisorDecision {
 
 export type WorkerTaskStatus = "completed" | "partial" | "failed";
 
+export type WorkerFileOp =
+  | {
+      op: "write";
+      path: string;
+      content: string;
+    }
+  | {
+      op: "delete";
+      path: string;
+    };
+
 export interface WorkerResult {
   summary: string;
   changedFiles: string[];
@@ -45,6 +56,7 @@ export interface WorkerResult {
   deletedFiles: string[];
   risks: string[];
   openQuestions: string[];
+  fileOps: WorkerFileOp[];
   taskStatus: WorkerTaskStatus;
 }
 

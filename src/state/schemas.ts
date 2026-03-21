@@ -57,6 +57,19 @@ export const workerResultSchema = z.object({
   deletedFiles: z.array(z.string()),
   risks: z.array(z.string()),
   openQuestions: z.array(z.string()),
+  fileOps: z.array(
+    z.discriminatedUnion("op", [
+      z.object({
+        op: z.literal("write"),
+        path: z.string().min(1),
+        content: z.string()
+      }),
+      z.object({
+        op: z.literal("delete"),
+        path: z.string().min(1)
+      })
+    ])
+  ),
   taskStatus: z.enum(["completed", "partial", "failed"])
 });
 

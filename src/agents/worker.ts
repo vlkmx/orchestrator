@@ -6,7 +6,7 @@ import OpenAI from "openai";
 import { AppConfig } from "../config.js";
 import { Logger } from "../logger.js";
 import { workerResultSchema } from "../state/schemas.js";
-import { OrchestratorState, Task, WorkerResult } from "../state/types.js";
+import { OrchestratorState, Task, WorkerFileOp, WorkerResult } from "../state/types.js";
 import { WorkerContext } from "../tools/context-builder.js";
 import { ensureDir, readFileSafe, writeFileSafe } from "../tools/file-tools.js";
 import { callModelForJson } from "./llm.js";
@@ -42,7 +42,7 @@ export class WorkerAgent {
     let baseResult: WorkerResult;
     let rawResponse: string;
 
-    if (this.config.demoMode) {
+    if (this.config.demoMode || (this.config.deterministicWorker && task.type === "migrate_component")) {
       baseResult = this.createDemoResult(task);
       rawResponse = JSON.stringify(baseResult);
     } else {
@@ -61,6 +61,8 @@ export class WorkerAgent {
           currentTask: task,
           compactSummary: context.summary,
           relevantFiles: context.relevantFiles,
+          sourceFileContents: await this.readTaskFiles(this.config.projectSourcePath, task.sourcePaths),
+          targetFileContents: await this.readTaskFiles(this.config.projectTargetPath, task.targetPaths),
           lastValidation: context.lastValidation,
           recentHistory: context.recentHistory
         }
@@ -93,6 +95,7 @@ export class WorkerAgent {
       deletedFiles: [],
       risks: task.type === "migrate_component" ? ["Potential style or prop mismatch after migration"] : [],
       openQuestions: [],
+      fileOps: [],
       taskStatus: "completed"
     };
   }
@@ -113,50 +116,60 @@ export class WorkerAgent {
 
     const createdFiles: string[] = [];
     const changedFiles: string[] = [];
+    if (this.config.workerWriteReports) {
+      const reportDir = path.join(this.config.projectTargetPath, ".orchestrator", "steps");
+      await ensureDir(reportDir);
 
-    const reportDir = path.join(this.config.projectTargetPath, ".orchestrator", "steps");
-    await ensureDir(reportDir);
+      const reportPath = path.join(reportDir, `${String(iteration).padStart(3, "0")}-${task.id}.md`);
+      const reportContent = [
+        `# Iteration ${iteration}`,
+        "",
+        `- Task ID: ${task.id}`,
+        `- Task Title: ${task.title}`,
+        `- Task Type: ${task.type}`,
+        `- Component: ${task.component}`,
+        `- Worker Status: ${workerResult.taskStatus}`,
+        "",
+        "## Summary",
+        workerResult.summary,
+        "",
+        "## Risks",
+        ...(workerResult.risks.length > 0 ? workerResult.risks.map((risk) => `- ${risk}`) : ["- none"]),
+        "",
+        "## Open Questions",
+        ...(workerResult.openQuestions.length > 0
+          ? workerResult.openQuestions.map((question) => `- ${question}`)
+          : ["- none"])
+      ].join("\n");
 
-    const reportPath = path.join(reportDir, `${String(iteration).padStart(3, "0")}-${task.id}.md`);
-    const reportContent = [
-      `# Iteration ${iteration}`,
-      "",
-      `- Task ID: ${task.id}`,
-      `- Task Title: ${task.title}`,
-      `- Task Type: ${task.type}`,
-      `- Component: ${task.component}`,
-      `- Worker Status: ${workerResult.taskStatus}`,
-      "",
-      "## Summary",
-      workerResult.summary,
-      "",
-      "## Risks",
-      ...(workerResult.risks.length > 0 ? workerResult.risks.map((risk) => `- ${risk}`) : ["- none"]),
-      "",
-      "## Open Questions",
-      ...(workerResult.openQuestions.length > 0
-        ? workerResult.openQuestions.map((question) => `- ${question}`)
-        : ["- none"])
-    ].join("\n");
-
-    const existingReport = await readFileSafe(reportPath);
-    await writeFileSafe(reportPath, `${reportContent}\n`);
-    if (existingReport === null) {
-      createdFiles.push(reportPath);
-    } else {
-      changedFiles.push(reportPath);
+      const existingReport = await readFileSafe(reportPath);
+      await writeFileSafe(reportPath, `${reportContent}\n`);
+      if (existingReport === null) {
+        createdFiles.push(reportPath);
+      } else {
+        changedFiles.push(reportPath);
+      }
     }
 
-    if (task.type === "migrate_component") {
+    const fromOps = await this.applyModelFileOps(workerResult.fileOps);
+    createdFiles.push(...fromOps.createdFiles);
+    changedFiles.push(...fromOps.changedFiles);
+
+    if (this.config.deterministicWorker && task.type === "migrate_component") {
       const migrated = await this.copySourceToTarget(task);
       createdFiles.push(...migrated.createdFiles);
       changedFiles.push(...migrated.changedFiles);
+      return {
+        changedFiles: unique(changedFiles),
+        createdFiles: unique(createdFiles),
+        deletedFiles: []
+      };
     }
 
     return {
       changedFiles: unique(changedFiles),
       createdFiles: unique(createdFiles),
-      deletedFiles: []
+      deletedFiles: unique(fromOps.deletedFiles)
     };
   }
 
@@ -200,6 +213,75 @@ export class WorkerAgent {
       createdFiles,
       deletedFiles: []
     };
+  }
+
+  private async applyModelFileOps(fileOps: WorkerFileOp[]): Promise<ArtifactChangeSet> {
+    const createdFiles: string[] = [];
+    const changedFiles: string[] = [];
+    const deletedFiles: string[] = [];
+
+    for (const fileOp of fileOps) {
+      const targetAbs = this.safeResolveTargetPath(fileOp.path);
+      if (!targetAbs) {
+        this.logger.warn(`Worker returned path outside target root: ${fileOp.path}`);
+        continue;
+      }
+
+      if (fileOp.op === "write") {
+        const before = await readFileSafe(targetAbs);
+        await writeFileSafe(targetAbs, fileOp.content);
+        if (before === null) {
+          createdFiles.push(targetAbs);
+        } else {
+          changedFiles.push(targetAbs);
+        }
+        continue;
+      }
+
+      if (fileOp.op === "delete") {
+        try {
+          await fs.unlink(targetAbs);
+          deletedFiles.push(targetAbs);
+        } catch {
+          // Ignore missing files.
+        }
+      }
+    }
+
+    return {
+      changedFiles,
+      createdFiles,
+      deletedFiles
+    };
+  }
+
+  private safeResolveTargetPath(relativeOrAbsolutePath: string): string | null {
+    const normalized = path.isAbsolute(relativeOrAbsolutePath)
+      ? relativeOrAbsolutePath
+      : path.resolve(this.config.projectTargetPath, relativeOrAbsolutePath);
+    const resolved = path.resolve(normalized);
+    const targetRoot = path.resolve(this.config.projectTargetPath) + path.sep;
+    if (!(resolved + path.sep).startsWith(targetRoot)) {
+      return null;
+    }
+    return resolved;
+  }
+
+  private async readTaskFiles(
+    root: string,
+    relativePaths: string[]
+  ): Promise<Record<string, string>> {
+    const output: Record<string, string> = {};
+
+    for (const relativePath of relativePaths) {
+      const absolutePath = path.resolve(root, relativePath);
+      const content = await readFileSafe(absolutePath);
+      if (content !== null) {
+        output[relativePath] = content;
+      }
+    }
+
+    return output;
   }
 }
 

@@ -32,6 +32,7 @@ interface RunRecord {
 
 const runs = new Map<string, RunRecord>();
 let activeRunId: string | null = null;
+const appendQueues = new Map<string, Promise<void>>();
 
 const runPayloadSchema = z.object({
   goal: z.string().min(1),
@@ -44,7 +45,13 @@ const runPayloadSchema = z.object({
   maxRetriesPerTask: z.coerce.number().int().positive().default(3),
   dryRun: z.boolean().default(false),
   verbose: z.boolean().default(true),
-  demoMode: z.boolean().default(true)
+  demoMode: z.boolean().default(false),
+  deterministicSupervisor: z.boolean().default(true),
+  deterministicWorker: z.boolean().default(false)
+});
+
+eventBus.on("event", (event: RuntimeEvent) => {
+  void persistEvent(event);
 });
 
 app.get("/api/health", (_req, res) => {
@@ -99,13 +106,17 @@ app.get("/api/runs/:runId", async (req, res) => {
   const statePath = path.join(run.config.stateDir, "state.json");
   const summaryPath = path.join(run.config.stateDir, "context-summary.md");
   const latestPath = path.join(run.config.logsDir, "latest.md");
+  const eventsPath = path.join(run.config.logsDir, "events.ndjson");
+  const commandsPath = path.join(run.config.logsDir, "commands.ndjson");
   const iterationDir = path.join(run.config.logsDir, "iterations");
 
-  const [state, summary, latest, iterationFiles] = await Promise.all([
+  const [state, summary, latest, iterationFiles, events, commands] = await Promise.all([
     readSafeJson(statePath),
     readSafeText(summaryPath),
     readSafeText(latestPath),
-    readIterationFiles(iterationDir)
+    readIterationFiles(iterationDir),
+    readSafeText(eventsPath),
+    readSafeText(commandsPath)
   ]);
 
   res.json({
@@ -114,7 +125,9 @@ app.get("/api/runs/:runId", async (req, res) => {
       state,
       summary,
       latest,
-      iterationFiles
+      iterationFiles,
+      events,
+      commands
     }
   });
 });
@@ -142,6 +155,15 @@ app.post("/api/runs/start", async (req, res) => {
   }
 
   const payload = runPayloadSchema.parse(req.body);
+  if (!isWithinProject(path.resolve(payload.projectSourcePath))) {
+    res.status(400).json({ error: "projectSourcePath must be inside current project folder" });
+    return;
+  }
+  if (!isWithinProject(path.resolve(payload.projectTargetPath))) {
+    res.status(400).json({ error: "projectTargetPath must be inside current project folder" });
+    return;
+  }
+
   const runId = createRunId();
   const runRoot = path.resolve(process.cwd(), ".orchestrator-data", "runs", runId);
 
@@ -157,6 +179,8 @@ app.post("/api/runs/start", async (req, res) => {
     testCommand: payload.testCommand,
     maxIterations: payload.maxIterations,
     maxRetriesPerTask: payload.maxRetriesPerTask,
+    deterministicSupervisor: payload.deterministicSupervisor,
+    deterministicWorker: payload.deterministicWorker,
     stateDir: path.join(runRoot, "state"),
     logsDir: path.join(runRoot, "logs")
   };
@@ -185,6 +209,8 @@ app.post("/api/runs/start", async (req, res) => {
         stateDir: config.stateDir,
         logsDir: config.logsDir,
         demoMode: config.demoMode,
+        deterministicSupervisor: config.deterministicSupervisor,
+        deterministicWorker: config.deterministicWorker,
         dryRun: payload.dryRun
       }
     }
@@ -264,4 +290,37 @@ async function readIterationFiles(iterationDir: string): Promise<string[]> {
   } catch {
     return [];
   }
+}
+
+function isWithinProject(absolutePath: string): boolean {
+  const projectRoot = path.resolve(process.cwd());
+  const normalized = path.resolve(absolutePath);
+  const rootPrefix = projectRoot.endsWith(path.sep) ? projectRoot : `${projectRoot}${path.sep}`;
+  return normalized === projectRoot || normalized.startsWith(rootPrefix);
+}
+
+async function persistEvent(event: RuntimeEvent): Promise<void> {
+  const run = runs.get(event.runId);
+  if (!run) {
+    return;
+  }
+
+  const eventFile = path.join(run.config.logsDir, "events.ndjson");
+  const commandFile = path.join(run.config.logsDir, "commands.ndjson");
+  const line = `${JSON.stringify(event)}\n`;
+
+  const previous = appendQueues.get(event.runId) ?? Promise.resolve();
+  const next = previous
+    .then(async () => {
+      await fs.mkdir(run.config.logsDir, { recursive: true });
+      await fs.appendFile(eventFile, line, "utf8");
+      if (event.type.startsWith("command_")) {
+        await fs.appendFile(commandFile, line, "utf8");
+      }
+    })
+    .catch(() => {
+      // Ignore persistence failures to avoid breaking main run loop.
+    });
+
+  appendQueues.set(event.runId, next);
 }

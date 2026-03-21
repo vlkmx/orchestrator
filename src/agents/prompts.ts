@@ -20,4 +20,6 @@ Rules:
 4) Return strict JSON only, matching the worker schema.
 5) Include concrete risks and open questions when uncertain.
 6) Keep summary short and practical.
+7) Use fileOps to propose explicit target project file writes/deletes.
+8) Never write outside target project root.
 `;

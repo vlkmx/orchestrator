@@ -53,6 +53,8 @@ interface RunArtifacts {
   summary: string | null;
   latest: string | null;
   iterationFiles: string[];
+  events?: string | null;
+  commands?: string | null;
 }
 
 interface CurrentRunResponse {
@@ -76,6 +78,8 @@ interface StartPayload {
   dryRun: boolean;
   verbose: boolean;
   demoMode: boolean;
+  deterministicSupervisor: boolean;
+  deterministicWorker: boolean;
 }
 
 const defaultPayload: StartPayload = {
@@ -89,7 +93,9 @@ const defaultPayload: StartPayload = {
   maxRetriesPerTask: 3,
   dryRun: false,
   verbose: true,
-  demoMode: true
+  demoMode: false,
+  deterministicSupervisor: true,
+  deterministicWorker: false
 };
 
 export default function App(): ReactElement {
@@ -306,6 +312,20 @@ export default function App(): ReactElement {
                 checked={payload.demoMode}
                 onChange={(checked) => setPayload((prev) => ({ ...prev, demoMode: checked }))}
               />
+              <Toggle
+                label="Deterministic Supervisor"
+                checked={payload.deterministicSupervisor}
+                onChange={(checked) =>
+                  setPayload((prev) => ({ ...prev, deterministicSupervisor: checked }))
+                }
+              />
+              <Toggle
+                label="Deterministic Worker"
+                checked={payload.deterministicWorker}
+                onChange={(checked) =>
+                  setPayload((prev) => ({ ...prev, deterministicWorker: checked }))
+                }
+              />
             </div>
 
             <div className="md:col-span-2 flex items-center justify-between gap-4">
@@ -430,6 +450,34 @@ export default function App(): ReactElement {
                 {selectedIteration ?? "Select iteration log"}
               </div>
               <pre className="m-0 whitespace-pre-wrap text-xs text-slate-200">{iterationContent || "No iteration selected."}</pre>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-2">
+        <Card>
+          <CardHeader>
+            <CardTitle>Persisted Events (NDJSON)</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="max-h-[320px] overflow-auto rounded-md bg-slate-950 p-3">
+              <pre className="m-0 whitespace-pre-wrap text-xs text-slate-200">
+                {artifacts?.events?.trim() || "No persisted events yet."}
+              </pre>
+            </div>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle>Persisted Commands (NDJSON)</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <div className="max-h-[320px] overflow-auto rounded-md bg-slate-950 p-3">
+              <pre className="m-0 whitespace-pre-wrap text-xs text-slate-200">
+                {artifacts?.commands?.trim() || "No persisted command events yet."}
+              </pre>
             </div>
           </CardContent>
         </Card>
